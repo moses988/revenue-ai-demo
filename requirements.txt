@@ -1,0 +1,42 @@
+# # requirements.txt content:
+
+# # Core Data Science stack
+# numpy
+# pandas
+# scikit-learn
+# streamlit
+# joblib
+# # Visualization libraries
+# matplotlib
+# seaborn
+
+# # Deep Learning (if needed)
+# tensorflow
+
+
+
+# --- 1. The Core AI Logic (Your List) ---
+numpy
+pandas
+scikit-learn
+joblib
+
+# --- 2. The App & UI (Your List) ---
+streamlit
+
+# --- 3. The Secure Business Backend (CRITICAL ADDITIONS) ---
+# You need these to build the "Hub & Spoke" architecture
+fastapi
+uvicorn
+pydantic
+python-multipart
+slowapi 
+requests
+
+# --- 4. Optional (Keep if you want to test charts locally) ---
+matplotlib
+seaborn
+
+# --- Note on TensorFlow ---
+# We are skipping TensorFlow for now. It is too heavy (500MB+) 
+# and will slow down your 10-day launch. We can add it later.
