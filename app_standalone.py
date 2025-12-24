@@ -1,102 +1,154 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import joblib
+import altair as alt
 from sklearn.ensemble import HistGradientBoostingRegressor
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
-import io
 
-# --- PAGE CONFIG ---
-st.set_page_config(page_title="Revenue Intelligence AI", page_icon="📈", layout="wide")
+# --- PAGE CONFIGURATION (Neutral & Professional) ---
+st.set_page_config(
+    page_title="Growth Intelligence Dashboard", 
+    page_icon="📈", 
+    layout="wide"
+)
 
-# --- 1. AI ENGINE (Integrated directly for easy hosting) ---
+# --- 1. INTELLIGENCE ENGINE (The Logic) ---
+
 @st.cache_resource
-def train_model(df):
-    """Trains the AI on the uploaded data instantly."""
-    # Simple Cleaning
-    df = df.fillna(0)
+def process_data_and_train(df):
+    """
+    Analyzes Client Data securely.
+    """
+    df = df.copy()
     
-    # Feature Engineering (Simplified for Generic Data)
-    # We look for common columns or create dummy ones
-    if 'Month' not in df.columns:
-        df['Month'] = np.random.randint(1, 13, size=len(df))
-    if 'Quarter' not in df.columns:
-        df['Quarter'] = df['Month'].apply(lambda x: (x-1)//3 + 1)
+    # Smart Column Detection
+    cols = df.columns
+    date_col = next((c for c in cols if 'Date' in c or 'Time' in c), None)
+    cust_col = next((c for c in cols if 'Customer' in c or 'Name' in c), None)
+    amt_col = next((c for c in cols if 'Total' in c or 'Amount' in c or 'Price' in c or 'Value' in c), None)
+    prod_col = next((c for c in cols if 'Product' in c or 'Item' in c or 'Description' in c or 'SKU' in c), None)
+    
+    if not date_col or not cust_col or not amt_col:
+        return None, f"❌ Data Error: Please ensure CSV has Date, Customer, and Amount columns."
+    
+    # Cleaning
+    df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+    df = df.dropna(subset=[date_col]) 
+    df[amt_col] = pd.to_numeric(df[amt_col], errors='coerce').fillna(0)
+    
+    # RFM Analysis (Retention Logic)
+    snapshot_date = df[date_col].max() + pd.Timedelta(days=1)
+    rfm = df.groupby(cust_col).agg({
+        date_col: lambda x: (snapshot_date - x.max()).days,
+        amt_col: ['count', 'sum', 'mean']
+    }).reset_index()
+    rfm.columns = ['Customer', 'Recency_Days', 'Frequency_Count', 'Total_LTV', 'Avg_Order_Value']
+    
+    # Risk Calculation
+    rfm['Churn_Risk_Score'] = (rfm['Recency_Days'] / rfm['Recency_Days'].max()) * 100
+    
+    return {
+        'df_clean': df,
+        'rfm_data': rfm,
+        'cols': {'cust': cust_col, 'prod': prod_col}
+    }, None
+
+def generate_cross_sell(df, cust_col, prod_col):
+    """
+    Market Basket Analysis (Expansion Logic) - SAFE VERSION
+    """
+    if not prod_col or df.empty: return pd.DataFrame()
+    if df[prod_col].nunique() < 2: return pd.DataFrame()
         
-    # Encoder for Customer Names
-    le = LabelEncoder()
-    # Assume first string column is Customer Name if not explicit
-    cust_col = [c for c in df.columns if 'Customer' in c or 'Name' in c][0]
-    df['CustomerID_Encoded'] = le.fit_transform(df[cust_col].astype(str))
+    top_products = df[prod_col].value_counts().head(50).index
+    df_top = df[df[prod_col].isin(top_products)]
     
-    # Target: Try to find a 'Total', 'Amount', or 'DealValue' column
-    target_col = [c for c in df.columns if 'Total' in c or 'Amount' in c or 'Price' in c][0]
+    basket = pd.crosstab(df_top[cust_col], df_top[prod_col])
+    basket = (basket > 0).astype(int)
     
-    X = df[['Month', 'Quarter', 'CustomerID_Encoded']]
-    y = df[target_col]
-    
-    # Train Model
-    model = HistGradientBoostingRegressor()
-    model.fit(X, y)
-    
-    return model, le, cust_col, target_col
+    if basket.shape[1] < 2: return pd.DataFrame()
 
-# --- 2. THE DASHBOARD ---
-st.title("🤖 Enterprise Revenue Intelligence System")
-st.markdown("### Upload your Sales Data (CSV) to generate AI predictions.")
+    cooc = basket.T.dot(basket)
+    opportunities = []
+    
+    for product_A in cooc.columns:
+        correlations = cooc[product_A].sort_values(ascending=False)
+        if len(correlations) > 1:
+            top_match = correlations.index[1]
+            targets = basket[(basket[product_A] == 1) & (basket[top_match] == 0)].index.tolist()
+            if len(targets) > 0:
+                opportunities.append({
+                    "Customer Bought": product_A,
+                    "Likely Needs": top_match,
+                    "Missed Opportunities": len(targets),
+                    "Target Customers": ", ".join(str(x) for x in targets[:3])
+                })
+    
+    if not opportunities: return pd.DataFrame()
+    return pd.DataFrame(opportunities).sort_values('Missed Opportunities', ascending=False)
 
-uploaded_file = st.file_uploader("Upload Invoice Data CSV", type=["csv"])
+# --- 2. THE CLIENT DASHBOARD ---
 
-if uploaded_file is not None:
-    try:
-        df = pd.read_csv(uploaded_file)
-        st.success(f"✅ Data Loaded: {len(df)} invoices detected.")
+st.sidebar.title("📊 Partner Portal")
+st.sidebar.info("Upload Sales Data (CSV) to unlock insights.")
+uploaded_file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
+
+st.title("Business Intelligence Overview")
+st.markdown("### Revenue Recovery & Growth System")
+
+if uploaded_file:
+    raw_df = pd.read_csv(uploaded_file)
+    with st.spinner("Analyzing purchase patterns..."):
+        data_bundle, error = process_data_and_train(raw_df)
         
-        # Train AI Live
-        with st.spinner("Training Custom AI Model on your data..."):
-            model, le, cust_col, target_col = train_model(df)
+    if error:
+        st.error(error)
+    else:
+        df = data_bundle['df_clean']
+        rfm = data_bundle['rfm_data']
+        cols = data_bundle['cols']
+        
+        # KEY METRICS (Client Focused)
+        kpi1, kpi2, kpi3 = st.columns(3)
+        kpi1.metric("Active Customers", len(rfm))
+        kpi2.metric("Total Revenue Analyzed", f"₹{rfm['Total_LTV'].sum():,.0f}")
+        high_risk = len(rfm[rfm['Churn_Risk_Score'] > 70])
+        kpi3.metric("⚠️ Clients at Risk", high_risk, delta="Needs Attention", delta_color="inverse")
         
         st.divider()
         
-        # --- PREDICTION INTERFACE ---
-        col1, col2 = st.columns(2)
+        tab1, tab2 = st.tabs(["🛡️ Retention (Save Money)", "🚀 Expansion (Make Money)"])
         
-        with col1:
-            st.subheader("🔮 Predict Future Spending")
-            # Get unique customers
-            unique_customers = df[cust_col].unique()
-            selected_customer = st.selectbox("Select a Customer to Analyze:", unique_customers)
-            
-            # Inputs
-            selected_month = st.slider("Forecast Month:", 1, 12, 6)
-            
-            if st.button("Generate Revenue Forecast"):
-                # Prepare Input
-                cust_id = le.transform([selected_customer])[0]
-                quarter = (selected_month-1)//3 + 1
-                input_data = [[selected_month, quarter, cust_id]]
+        with tab1:
+            col1, col2 = st.columns([2,1])
+            with col1:
+                st.subheader("Customer Health Matrix")
+                chart = alt.Chart(rfm).mark_circle(size=100).encode(
+                    x=alt.X('Total_LTV', title='Customer Value'),
+                    y=alt.Y('Recency_Days', title='Days Since Last Order'),
+                    color=alt.Color('Churn_Risk_Score', scale=alt.Scale(scheme='redyellowgreen', reverse=True)),
+                    tooltip=['Customer', 'Recency_Days', 'Total_LTV']
+                ).interactive()
+                st.altair_chart(chart, use_container_width=True)
+            with col2:
+                st.subheader("🚨 Priority Call List")
+                st.caption("High Value customers who haven't ordered recently.")
+                st.dataframe(
+                    rfm.sort_values(['Total_LTV', 'Recency_Days'], ascending=[False, False])
+                    .head(10)[['Customer', 'Recency_Days']],
+                    hide_index=True
+                )
                 
-                # Predict
-                prediction = model.predict(input_data)[0]
-                
-                st.metric(label=f"Predicted Spend for {selected_customer}", 
-                          value=f"₹{prediction:,.2f}")
-                
-                if prediction > df[df[cust_col] == selected_customer][target_col].mean():
-                    st.success("🚀 Insight: This customer is expected to spend ABOVE their average.")
+        with tab2:
+            st.subheader("📦 Hidden Cross-Sell Opportunities")
+            if cols['prod']:
+                upsell_df = generate_cross_sell(df, cols['cust'], cols['prod'])
+                if not upsell_df.empty:
+                    st.dataframe(upsell_df, use_container_width=True, hide_index=True)
                 else:
-                    st.warning("⚠️ Insight: Churn Risk? Predicted spend is LOWER than average.")
-
-        with col2:
-            st.subheader("📊 Historical Analysis")
-            cust_data = df[df[cust_col] == selected_customer]
-            st.line_chart(cust_data[target_col].reset_index(drop=True))
-            st.caption("Past Transaction History")
-
-    except Exception as e:
-        st.error(f"Error processing data: {e}")
-        st.info("Make sure your CSV has columns for 'Customer Name' and 'Total Amount'.")
+                    st.info("No strong product correlations found yet.")
+            else:
+                st.warning("Upload a file with 'Product' or 'Item' columns to see Upsell data.")
 
 else:
-    st.info("👆 Upload the 'real_sales_data.csv' file to test the demo.")
+    st.info("👋 Welcome. Please upload the sales data to begin the audit.")
