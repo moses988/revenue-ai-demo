@@ -20,6 +20,7 @@ numpy
 pandas
 scikit-learn
 joblib
+fpdf2
 
 # --- 2. The App & UI (Your List) ---
 streamlit
@@ -39,4 +40,5 @@ seaborn
 
 # --- Note on TensorFlow ---
 # We are skipping TensorFlow for now. It is too heavy (500MB+) 
+
 # and will slow down your 10-day launch. We can add it later.
