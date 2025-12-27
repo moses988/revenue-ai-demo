@@ -2,9 +2,10 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
+from fpdf import FPDF
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.preprocessing import LabelEncoder
-
+from datetime import datetime
 # --- PAGE CONFIGURATION (Neutral & Professional) ---
 st.set_page_config(
     page_title="Growth Intelligence Dashboard", 
@@ -87,6 +88,98 @@ def generate_cross_sell(df, cust_col, prod_col):
     if not opportunities: return pd.DataFrame()
     return pd.DataFrame(opportunities).sort_values('Missed Opportunities', ascending=False)
 
+
+# --- NEW: PDF GENERATION LOGIC ---
+class AuditReport(FPDF):
+    def header(self):
+        self.set_font('Arial', 'B', 15)
+        self.cell(0, 10, 'Business Intelligence Audit Report', 0, 1, 'C')
+        self.ln(5)
+
+    def footer(self):
+        self.set_y(-15)
+        self.set_font('Arial', 'I', 8)
+        self.cell(0, 10, f'Generated on {datetime.now().strftime("%Y-%m-%d")} | Page {self.page_no()}', 0, 0, 'C')
+
+def create_pdf(rfm_df, total_revenue, active_cust, at_risk,at_risk_df):
+    pdf = AuditReport()
+    pdf.add_page()
+    
+    # Summary Section
+    pdf.set_font('Arial', 'B', 12)
+    pdf.cell(0, 10, "Executive Summary", 0, 1, 'L')
+    pdf.set_font('Arial', '', 11)
+    pdf.cell(0, 8, f"Total Revenue Analyzed: {total_revenue}", 0, 1)
+    pdf.cell(0, 8, f"Active Customers: {active_cust}", 0, 1)
+    pdf.set_text_color(200, 0, 0)
+    pdf.cell(0, 8, f"Clients at High Risk: {at_risk}", 0, 1)
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(10)
+
+    # Priority Call List Table
+    pdf.set_font('Arial', 'B', 12)
+    pdf.cell(0, 10, "Priority Retention List (Top 10 High Value/Risk)", 0, 1, 'L')
+    
+    # Table Header
+    pdf.set_font('Arial', 'B', 10)
+    pdf.cell(60, 8, 'Customer Name', 1)
+    pdf.cell(40, 8, 'Status', 1)
+    pdf.cell(40, 8, 'Total LTV', 1)
+    pdf.cell(30, 8, 'Recency (Days)', 1,1)
+    
+    
+    
+    # Table Data
+    pdf.set_font('Arial', '', 10)
+    priority_list = rfm_df.sort_values(['Total_LTV', 'Recency_Days'], ascending=[False, False]).head(10)
+    # for index, row in priority_list.iterrows():
+    #     pdf.cell(80, 8, str(row['Customer']), 1)
+    #     pdf.cell(50, 8, str(row['Recency_Days']), 1)
+    #     pdf.cell(50, 8, f"{row['Total_LTV']:,.0f}", 1, 1)
+    for _, row in priority_list.iterrows():
+        is_high_risk = row['Churn_Risk_Score'] > 70
+        
+        if is_high_risk:
+            pdf.set_text_color(200, 0, 0)
+            status = "!!! FLAG !!!"
+        else:
+            status = "Stable"
+            
+        pdf.cell(60, 8, str(row['Customer']), 1)
+        pdf.cell(40, 8, status, 1)
+        pdf.cell(40, 8, f"{row['Total_LTV']:,.0f}", 1)
+        pdf.cell(30, 8, f"{int(row['Recency_Days'])}d", 1, 1)
+        pdf.set_text_color(0, 0, 0)    
+    # return pdf.output(dest='S')
+    # Page 2: Dedicated At-Risk Table
+    pdf.add_page()
+    pdf.set_font('Arial', 'B', 14)
+    pdf.set_text_color(200, 0, 0) # Red Heading
+    pdf.cell(0, 10, "HIGH-RISK CLIENT RECOVERY LIST", 0, 1, 'L')
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_font('Arial', '', 10)
+    pdf.cell(0, 8, f"The following clients have a Churn Risk Score > 70%:", 0, 1)
+    pdf.ln(5)
+
+    # Table Header
+    pdf.set_fill_color(240, 240, 240)
+    pdf.set_font('Arial', 'B', 10)
+    pdf.cell(70, 10, 'Client Name', 1, 0, 'C', True)
+    pdf.cell(40, 10, 'Potential Loss', 1, 0, 'C', True)
+    pdf.cell(40, 10, 'Days Inactive', 1, 0, 'C', True)
+    pdf.cell(30, 10, 'Risk %', 1, 1, 'C', True)
+
+    # Table Rows
+    pdf.set_font('Arial', size=10)
+    for _, row in at_risk_df.iterrows():
+        pdf.cell(70, 8, str(row['Customer']), 1)
+        pdf.cell(40, 8, f"INR {row['Total_LTV']:,.0f}", 1)
+        pdf.cell(40, 8, f"{int(row['Recency_Days'])} days", 1)
+        pdf.cell(30, 8, f"{int(row['Churn_Risk_Score'])}%", 1, 1)
+    return bytes(pdf.output(dest='S'))
+
+
+
 # --- 2. THE CLIENT DASHBOARD ---
 
 st.sidebar.title("📊 Partner Portal")
@@ -107,16 +200,35 @@ if uploaded_file:
         df = data_bundle['df_clean']
         rfm = data_bundle['rfm_data']
         cols = data_bundle['cols']
+
+        # PDF Download Button in Sidebar
+        total_rev_str = f"INR {rfm['Total_LTV'].sum():,.0f}"
+        active_cust = len(rfm)
+        high_risk = len(rfm[rfm['Churn_Risk_Score'] > 70])
+        at_risk_df = rfm[rfm['Churn_Risk_Score'] > 70].copy()
+        at_risk_df = at_risk_df.sort_values('Total_LTV', ascending=False)
+        pdf_bytes = create_pdf(rfm, total_rev_str, active_cust, high_risk,at_risk_df)
+        st.sidebar.download_button(
+            label="📥 Download Audit Report (PDF)",
+            data=pdf_bytes,
+            file_name=f"Growth_Audit_{datetime.now().strftime('%Y%m%d')}.pdf",
+            mime="application/pdf",
+        )
         
         # KEY METRICS (Client Focused)
         kpi1, kpi2, kpi3 = st.columns(3)
         kpi1.metric("Active Customers", len(rfm))
         kpi2.metric("Total Revenue Analyzed", f"₹{rfm['Total_LTV'].sum():,.0f}")
         high_risk = len(rfm[rfm['Churn_Risk_Score'] > 70])
-        kpi3.metric("⚠️ Clients at Risk", high_risk, delta="Needs Attention", delta_color="inverse")
-        
+        # kpi3.metric("⚠️ Clients at Risk", high_risk, delta="Needs Attention", delta_color="inverse")
+        at_risk_mask = rfm['Churn_Risk_Score'] > 70
+        risk_df = rfm[at_risk_mask]
+        total_loss_at_risk = risk_df['Total_LTV'].sum()
+        kpi3.metric("⚠️ Revenue at Risk", f"₹{total_loss_at_risk:,.0f}", delta=f"{len(risk_df)} Clients", delta_color="inverse")
         st.divider()
-        
+        at_risk_df = rfm[rfm['Churn_Risk_Score'] > 70].copy()
+        at_risk_df = at_risk_df.sort_values('Total_LTV', ascending=False)
+        total_loss = at_risk_df['Total_LTV'].sum()
         tab1, tab2 = st.tabs(["🛡️ Retention (Save Money)", "🚀 Expansion (Make Money)"])
         
         with tab1:
@@ -131,13 +243,45 @@ if uploaded_file:
                 ).interactive()
                 st.altair_chart(chart, use_container_width=True)
             with col2:
+                # st.subheader("🚨 Priority Call List")
+                # st.caption("High Value customers who haven't ordered recently.")
+                # st.dataframe(
+                #     rfm.sort_values(['Total_LTV', 'Recency_Days'], ascending=[False, False])
+                #     .head(10)[['Customer', 'Recency_Days']],
+                #     hide_index=True
+                # )
                 st.subheader("🚨 Priority Call List")
-                st.caption("High Value customers who haven't ordered recently.")
-                st.dataframe(
-                    rfm.sort_values(['Total_LTV', 'Recency_Days'], ascending=[False, False])
-                    .head(10)[['Customer', 'Recency_Days']],
-                    hide_index=True
+                display_df = rfm.sort_values(['Total_LTV', 'Recency_Days'], ascending=[False, False]).head(50).copy()
+                
+                # Create the Flag
+                display_df['Risk_Flag'] = display_df['Churn_Risk_Score'].apply(
+                    lambda x: "🚩 HIGH RISK" if x > 70 else "✅ STABLE"
                 )
+                
+                st.dataframe(
+                    display_df[['Customer', 'Total_LTV', 'Recency_Days' , 'Risk_Flag']],
+                    column_config={
+                        "Total_LTV": st.column_config.NumberColumn("Potential Loss", format="₹%d"),
+                        "Risk_Flag": "Status"
+                    },
+                    hide_index=True,
+                    use_container_width=True
+                )
+
+            st.divider()
+            st.subheader("🚩 At-Risk Client Details")
+            if not at_risk_df.empty:
+                st.dataframe(
+                    at_risk_df[['Customer', 'Total_LTV', 'Recency_Days', 'Churn_Risk_Score']],
+                    column_config={
+                        "Total_LTV": st.column_config.NumberColumn("Potential Loss", format="₹%d"),
+                        "Churn_Risk_Score": st.column_config.ProgressColumn("Risk Score", min_value=0, max_value=100)
+                    },
+                    hide_index=True,
+                    use_container_width=True
+                )
+            else:
+                st.success("No high-risk clients detected.")    
                 
         with tab2:
             st.subheader("📦 Hidden Cross-Sell Opportunities")
