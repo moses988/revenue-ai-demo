@@ -12,7 +12,15 @@ st.set_page_config(
     page_icon="📈", 
     layout="wide"
 )
-
+# Hide the Streamlit header and footer
+hide_st_style = """
+            <style>
+            #MainMenu {visibility: hidden;}
+            header {visibility: hidden;}
+            footer {visibility: hidden;}
+            </style>
+            """
+st.markdown(hide_st_style, unsafe_allow_html=True)
 # --- 1. INTELLIGENCE ENGINE (The Logic) ---
 
 @st.cache_resource
@@ -51,7 +59,7 @@ def process_data_and_train(df):
     return {
         'df_clean': df,
         'rfm_data': rfm,
-        'cols': {'cust': cust_col, 'prod': prod_col}
+        'cols': {'cust': cust_col, 'prod': prod_col, 'date': date_col, 'amt': amt_col}
     }, None
 
 def generate_cross_sell(df, cust_col, prod_col):
@@ -87,6 +95,32 @@ def generate_cross_sell(df, cust_col, prod_col):
     
     if not opportunities: return pd.DataFrame()
     return pd.DataFrame(opportunities).sort_values('Missed Opportunities', ascending=False)
+
+
+def get_forecast(df, date_col, amt_col):
+    monthly = df.set_index(date_col).resample('ME')[amt_col].sum().reset_index()
+    if len(monthly) < 3: return None
+    model = HistGradientBoostingRegressor().fit(np.arange(len(monthly)).reshape(-1, 1), monthly[amt_col])
+    return model.predict([[len(monthly)]])[0]
+
+def get_script(name, risk, last_item):
+    msg = f"restock your {last_item}" if risk > 80 else f"check on your {last_item}"
+    return f"Hi {name}, it's been a while! We wanted to {msg}. Can we help?"
+
+
+def get_seasonality(df, date_col, amt_col):
+    """Identifies strongest and weakest months."""
+    df_monthly = df.copy()
+    df_monthly['Month'] = df_monthly[date_col].dt.month_name()
+    df_monthly['Month_Num'] = df_monthly[date_col].dt.month
+    
+    seasonal = df_monthly.groupby(['Month_Num', 'Month'])[amt_col].mean().reset_index()
+    seasonal = seasonal.sort_values('Month_Num')
+    
+    strongest = seasonal.loc[seasonal[amt_col].idxmax()]
+    weakest = seasonal.loc[seasonal[amt_col].idxmin()]
+    
+    return seasonal, strongest, weakest
 
 
 # --- NEW: PDF GENERATION LOGIC ---
@@ -182,7 +216,7 @@ def create_pdf(rfm_df, total_revenue, active_cust, at_risk,at_risk_df):
 
 # --- 2. THE CLIENT DASHBOARD ---
 
-st.sidebar.title("📊 Partner Portal")
+st.sidebar.title("📊 ProfitGuard AI")
 st.sidebar.info("Upload Sales Data (CSV) to unlock insights.")
 uploaded_file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
 
@@ -229,7 +263,7 @@ if uploaded_file:
         at_risk_df = rfm[rfm['Churn_Risk_Score'] > 70].copy()
         at_risk_df = at_risk_df.sort_values('Total_LTV', ascending=False)
         total_loss = at_risk_df['Total_LTV'].sum()
-        tab1, tab2 = st.tabs(["🛡️ Retention (Save Money)", "🚀 Expansion (Make Money)"])
+        tab1, tab2, tab3 = st.tabs(["🛡️ Retention (Save Money)", "🚀 Expansion (Make Money)","🔮 Projections"])
         
         with tab1:
             col1, col2 = st.columns([2,1])
@@ -251,7 +285,7 @@ if uploaded_file:
                 #     hide_index=True
                 # )
                 st.subheader("🚨 Priority Call List")
-                display_df = rfm.sort_values(['Total_LTV', 'Recency_Days'], ascending=[False, False]).head(50).copy()
+                display_df = rfm.sort_values(['Total_LTV', 'Recency_Days'], ascending=[False, False]).head(10).copy()
                 
                 # Create the Flag
                 display_df['Risk_Flag'] = display_df['Churn_Risk_Score'].apply(
@@ -293,6 +327,36 @@ if uploaded_file:
                     st.info("No strong product correlations found yet.")
             else:
                 st.warning("Upload a file with 'Product' or 'Item' columns to see Upsell data.")
+        
+        with tab3:
+            st.subheader("Revenue Projections")
+            forecast = get_forecast(df, cols['date'], cols['amt'])
+            if forecast:
+                st.metric("Predicted Next Month", f"₹{forecast:,.0f}")
+            else:
+                st.warning("Need more data for forecast.")
+            
+            st.divider()
+            
+            # Seasonality Section
+            st.subheader("📅 Seasonal Revenue Patterns")
+            seasonal_data, best, worst = get_seasonality(df, cols['date'], cols['amt'])
+            
+            col_a, col_b = st.columns([2, 1])
+            
+            with col_a:
+                # Seasonal Chart
+                seasonal_chart = alt.Chart(seasonal_data).mark_bar(color='#2196F3').encode(
+                    x=alt.X('Month:N', sort=None, title="Month"),
+                    y=alt.Y(f'{cols["amt"]}:Q', title="Average Revenue"),
+                    tooltip=['Month', f'{cols["amt"]}']
+                ).properties(height=300)
+                st.altair_chart(seasonal_chart, use_container_width=True)
+                
 
+            with col_b:
+                st.success(f"🌟 **Peak Performance:** {best['Month']}")
+                st.error(f"📉 **Lean Period:** {worst['Month']}")
+                st.info(f"💡 **Strategy:** Increase marketing spend in **{worst['Month']}** to offset the traditional seasonal dip.")    
 else:
     st.info("👋 Welcome. Please upload the sales data to begin the audit.")
