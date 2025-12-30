@@ -29,6 +29,9 @@ hide_st_style = """
             .stAppDeployButton {
                 display: none !important;
             }
+            [data-testid="manage-app-button"]{
+            display:none !important;
+            }
             </style>
             """
 st.markdown(hide_st_style, unsafe_allow_html=True)
@@ -371,4 +374,5 @@ if uploaded_file:
                 st.info(f"💡 **Strategy:** Increase marketing spend in **{worst['Month']}** to offset the traditional seasonal dip.")    
 else:
     st.info("👋 Welcome. Please upload the sales data to begin the audit.")
+
 
