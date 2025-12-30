@@ -12,12 +12,23 @@ st.set_page_config(
     page_icon="📈", 
     layout="wide"
 )
-# Hide the Streamlit header and footer
+# Updated CSS to target the new Streamlit header structure
 hide_st_style = """
             <style>
-            #MainMenu {visibility: hidden;}
-            header {visibility: hidden;}
-            footer {visibility: hidden;}
+            /* Hides the entire top header bar */
+            [data-testid="stHeader"] {
+                display: none !important;
+            }
+            
+            /* Specifically hides the "Made with Streamlit" footer */
+            footer {
+                visibility: hidden !important;
+            }
+
+            /* Optional: Hides the "Manage App" floating button for you as well */
+            .stAppDeployButton {
+                display: none !important;
+            }
             </style>
             """
 st.markdown(hide_st_style, unsafe_allow_html=True)
@@ -360,3 +371,4 @@ if uploaded_file:
                 st.info(f"💡 **Strategy:** Increase marketing spend in **{worst['Month']}** to offset the traditional seasonal dip.")    
 else:
     st.info("👋 Welcome. Please upload the sales data to begin the audit.")
+
