@@ -16,9 +16,7 @@ st.set_page_config(
 hide_st_style = """
             <style>
             /* Hides the entire top header bar */
-            [data-testid="stHeader"] {
-                display: none !important;
-            }
+            
             
             /* Specifically hides the "Made with Streamlit" footer */
             footer {
@@ -28,6 +26,9 @@ hide_st_style = """
             /* Optional: Hides the "Manage App" floating button for you as well */
             .stAppDeployButton {
                 display: none !important;
+            }
+            .st-emotion-cache-jma0kd{
+            display:none !important;
             }
             [data-testid="manage-app-button"]{
             display:none !important;
@@ -374,5 +375,6 @@ if uploaded_file:
                 st.info(f"💡 **Strategy:** Increase marketing spend in **{worst['Month']}** to offset the traditional seasonal dip.")    
 else:
     st.info("👋 Welcome. Please upload the sales data to begin the audit.")
+
 
 
