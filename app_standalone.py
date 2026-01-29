@@ -38,7 +38,8 @@ hide_st_style = """
 st.markdown(hide_st_style, unsafe_allow_html=True)
 # --- 1. INTELLIGENCE ENGINE (The Logic) ---
 
-@st.cache_resource
+# @st.cache_resource
+@st.cache_data
 def process_data_and_train(df):
     """
     Analyzes Client Data securely.
@@ -375,6 +376,7 @@ if uploaded_file:
                 st.info(f"💡 **Strategy:** Increase marketing spend in **{worst['Month']}** to offset the traditional seasonal dip.")    
 else:
     st.info("👋 Welcome. Please upload the sales data to begin the audit.")
+
 
 
 
