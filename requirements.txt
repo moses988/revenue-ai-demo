@@ -38,6 +38,7 @@ vl-convert-python
 bcrypt
 sqlalchemy
 psycopg2-binary
+lifetimes
 
 # --- 4. Optional (Keep if you want to test charts locally) ---
 matplotlib
