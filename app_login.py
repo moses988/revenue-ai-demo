@@ -16,6 +16,13 @@ import re
 
 import smtplib
 from email.mime.text import MIMEText
+from lifetimes import BetaGeoFitter, GammaGammaFitter
+from lifetimes.utils import summary_data_from_transaction_data
+
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+import seaborn as sns
+from tempfile import NamedTemporaryFile
 
 
 
@@ -197,6 +204,558 @@ def process_data(df):
         'cols': {'d': date_col, 'c': cust_col, 'a': amt_col, 'p': prod_col}
     }, None
 
+def get_predictive_clv(df, customer_id_col, date_col, amt_col):
+    """
+    Train BG/NBD and Gamma-Gamma models to predict future purchasing behavior.
+    """
+    # 1. Filter out non-positive data (returns/errors)
+    df = df[df[amt_col] > 0]
+
+    # 2. Transform data into RFM format required by lifetimes
+    # (frequency, recency, T, monetary_value)
+    data = summary_data_from_transaction_data(
+        df, customer_id_col, date_col, 
+        monetary_value_col=amt_col, 
+        observation_period_end=df[date_col].max()
+    )
+    
+    # 3. Fit BG/NBD Model (Predicts Frequency & Churn)
+    bgf = BetaGeoFitter(penalizer_coef=0.01)
+    bgf.fit(data['frequency'], data['recency'], data['T'])
+    
+    # 4. Predict expected transactions in the next 30 days
+    data['predicted_purchases_30d'] = bgf.conditional_expected_number_of_purchases_up_to_time(
+        30, data['frequency'], data['recency'], data['T']
+    )
+    
+    # 5. Fit Gamma-Gamma Model (Predicts Average Order Value)
+    # We only use customers with at least one repeat purchase for this
+    returning_customers = data[data['frequency'] > 0]
+    
+    if len(returning_customers) > 0:
+        ggf = GammaGammaFitter(penalizer_coef=0.01)
+        ggf.fit(returning_customers['frequency'], returning_customers['monetary_value'])
+        
+        # Calculate Predicted CLV (Customer Lifetime Value)
+        data['predicted_clv'] = ggf.customer_lifetime_value(
+            bgf, data['frequency'], data['recency'], data['T'], 
+            data['monetary_value'], time=1, discount_rate=0.01 # time=1 means 1 month
+        )
+    else:
+        data['predicted_clv'] = 0
+
+    return data.sort_values(by='predicted_purchases_30d', ascending=False)
+
+
+def get_aggregate_forecast(df, date_col, amt_col):
+    """Predicts total revenue for the next month using Gradient Boosting."""
+    # Resample to monthly revenue
+    monthly = df.set_index(date_col).resample('ME')[amt_col].sum().reset_index()
+    
+    if len(monthly) < 3: 
+        return None # Not enough data points
+        
+    # Prepare data for simple regression (X=Month Index, Y=Revenue)
+    X = np.arange(len(monthly)).reshape(-1, 1)
+    y = monthly[amt_col]
+    
+    model = HistGradientBoostingRegressor()
+    model.fit(X, y)
+    
+    # Predict next month (Index = len)
+    next_month_pred = model.predict([[len(monthly)]])[0]
+    return max(0, next_month_pred) # Ensure no negative revenue
+
+def get_seasonality_analysis(df, date_col, amt_col):
+    """Identifies strongest and weakest months based on historical averages."""
+    df = df.copy()
+    df['Month'] = df[date_col].dt.month_name()
+    df['Month_Num'] = df[date_col].dt.month
+    
+    # Group by Month Name and calculate average revenue
+    seasonal = df.groupby(['Month_Num', 'Month'])[amt_col].sum().reset_index()
+    seasonal = seasonal.sort_values('Month_Num')
+    
+    if seasonal.empty:
+        return None, None, None
+        
+    strongest = seasonal.loc[seasonal[amt_col].idxmax()]
+    weakest = seasonal.loc[seasonal[amt_col].idxmin()]
+    
+    return seasonal, strongest, weakest
+
+@st.cache_resource
+def get_cohort_analysis(df, cust_col, date_col):
+    """
+    Creates a Cohort Analysis Heatmap to track retention over time.
+    """
+    df = df.copy()
+    
+    # 1. Convert Date to Month Period (e.g., 2023-01)
+    df['OrderPeriod'] = df[date_col].dt.to_period('M')
+    
+    # 2. Determine the user's "Cohort" (Month of first purchase)
+    df['Cohort'] = df.groupby(cust_col)[date_col].transform('min').dt.to_period('M')
+    
+    # 3. Group data
+    cohort_data = df.groupby(['Cohort', 'OrderPeriod']).agg(n_customers=(cust_col, 'nunique')).reset_index()
+    
+    # 4. Calculate "Cohort Index" (Months since first purchase)
+    # Result is integer: 0 (first month), 1, 2, etc.
+    cohort_data['PeriodNumber'] = (cohort_data.OrderPeriod - cohort_data.Cohort).apply(lambda x: x.n)
+    
+    # 5. Pivot the table
+    cohort_pivot = cohort_data.pivot_table(index='Cohort', columns='PeriodNumber', values='n_customers')
+    
+    # 6. Calculate Retention Percentage
+    cohort_size = cohort_pivot.iloc[:, 0]
+    retention_matrix = cohort_pivot.divide(cohort_size, axis=0)
+    
+    return retention_matrix
+
+# ────────────────────────────────────────────────
+#  MARKET BASKET ANALYSIS (Upsell Logic)
+# ────────────────────────────────────────────────
+
+@st.cache_resource
+def generate_cross_sell(df, cust_col, prod_col):
+    """
+    Identifies products frequently bought together to generate upsell recommendations.
+    """
+    # 1. Safety Checks
+    if not prod_col or df.empty: 
+        return None, "⚠️ No 'Product' column detected in your CSV."
+    
+    # 2. Filter for Top 50 Products (Speed Optimization)
+    # We focus on top items to prevent memory crashes with huge catalogs
+    top_products = df[prod_col].value_counts().head(50).index
+    df_top = df[df[prod_col].isin(top_products)]
+    
+    if df_top[prod_col].nunique() < 2:
+        return None, "⚠️ Not enough different products to find patterns."
+
+    # 3. Create Basket Matrix (Customer x Product)
+    basket = pd.crosstab(df_top[cust_col], df_top[prod_col])
+    basket = (basket > 0).astype(int) # Convert to 1s and 0s
+    
+    if basket.shape[1] < 2: 
+        return None, "⚠️ Not enough data to calculate correlations."
+
+    # 4. Calculate Co-occurrence Matrix
+    cooc = basket.T.dot(basket)
+    opportunities = []
+    
+    # 5. Find Missed Opportunities
+    for product_A in cooc.columns:
+        # Find the product most correlated with Product A
+        correlations = cooc[product_A].sort_values(ascending=False)
+        
+        if len(correlations) > 1:
+            top_match = correlations.index[1] # Index 0 is the product itself
+            
+            # Find customers who bought A but NOT the match
+            targets = basket[(basket[product_A] == 1) & (basket[top_match] == 0)].index.tolist()
+            
+            if len(targets) > 0:
+                opportunities.append({
+                    "If they bought...": product_A,
+                    "They likely need...": top_match,
+                    "Potential Sales": len(targets),
+                    "Call These Customers": ", ".join(str(x) for x in targets[:3]) # Show top 3 examples
+                })
+    
+    if not opportunities: 
+        return None, "No strong correlations found yet."
+        
+    return pd.DataFrame(opportunities).sort_values('Potential Sales', ascending=False), None
+
+def render_scenario_simulator(rfm_df):
+    st.subheader("🧪 Strategy Simulator")
+    st.markdown("Simulate how small improvements impact your bottom line.")
+    
+    # 1. User Inputs
+    col1, col2 = st.columns(2)
+    with col1:
+        churn_reduction = st.slider("📉 If we reduce Churn by...", 0, 50, 10, format="%d%%")
+    with col2:
+        upsell_increase = st.slider("📈 If we increase Avg Order Value by...", 0, 50, 5, format="%d%%")
+        
+    # 2. Calculations
+    current_rev = rfm_df['Total_LTV'].sum()
+    
+    # Revenue recovered from churn (Simplified: Assuming we save X% of at-risk revenue)
+    at_risk_rev = rfm_df[rfm_df['Churn_Risk'] > 70]['Total_LTV'].sum()
+    saved_rev = at_risk_rev * (churn_reduction / 100)
+    
+    # Revenue gained from upsell
+    new_rev_base = current_rev + saved_rev
+    upsell_gain = new_rev_base * (upsell_increase / 100)
+    
+    total_projected = current_rev + saved_rev + upsell_gain
+    net_gain = total_projected - current_rev
+    
+    # 3. Visualization
+    st.divider()
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Current Revenue", f"₹{current_rev:,.0f}")
+    m2.metric("Projected Revenue", f"₹{total_projected:,.0f}", delta=f"+{churn_reduction + upsell_increase}% Growth")
+    m3.metric("💰 Net Profit Increase", f"₹{net_gain:,.0f}", delta="Extra Cash")
+    
+    # Simple Chart
+    chart_data = pd.DataFrame({
+        'Scenario': ['Current', 'With Strategy'],
+        'Revenue': [current_rev, total_projected]
+    })
+    st.bar_chart(chart_data, x='Scenario', y='Revenue', color='#00CC96')
+
+
+# --- CHART 1: SEASONALITY (Bar Chart) ---
+def create_seasonality_chart(seasonal_data):
+    if seasonal_data is None or seasonal_data.empty: return None
+    sns.set_style("whitegrid")
+    plt.figure(figsize=(10, 4))
+    ax = sns.barplot(x='Month', y='Total_LTV', data=seasonal_data, color='#2196F3')
+    plt.title('Monthly Revenue Trends', fontsize=12, fontweight='bold', color='#333333')
+    plt.xlabel(''); plt.ylabel('')
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, p: format(int(x), ',')))
+    sns.despine(left=True, bottom=True)
+    
+    temp_file = NamedTemporaryFile(delete=False, suffix=".png")
+    plt.savefig(temp_file.name, bbox_inches='tight', dpi=150)
+    plt.close()
+    return temp_file.name
+
+# --- CHART 2: RISK DISTRIBUTION (Donut Chart) ---
+def create_risk_chart(total_rev, risk_rev):
+    safe_rev = total_rev - risk_rev
+    labels = ['Safe Revenue', 'At Risk']
+    sizes = [safe_rev, risk_rev]
+    colors = ['#4CAF50', '#F44336'] # Green, Red
+    
+    plt.figure(figsize=(5, 5))
+    plt.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90, pctdistance=0.85, textprops={'fontsize': 12})
+    
+    # Draw circle for Donut shape
+    centre_circle = plt.Circle((0,0),0.70,fc='white')
+    fig = plt.gcf()
+    fig.gca().add_artist(centre_circle)
+    
+    plt.title('Revenue Health Analysis', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    
+    temp_file = NamedTemporaryFile(delete=False, suffix=".png")
+    plt.savefig(temp_file.name, bbox_inches='tight', dpi=150)
+    plt.close()
+    return temp_file.name
+
+# --- CHART 3: TOP UPSELL PRODUCTS (Horizontal Bar) ---
+def create_upsell_chart(upsell_df):
+    if upsell_df is None or upsell_df.empty: return None
+    # Prepare Top 5 Data
+    top_5 = upsell_df.head(5).copy()
+    # Ensure 'Potential Deals' is numeric
+    if 'Potential Deals' not in top_5.columns and 'Missed Sales Count' in top_5.columns:
+        top_5['Potential Deals'] = top_5['Missed Sales Count']
+        
+    sns.set_style("whitegrid")
+    plt.figure(figsize=(8, 4))
+    ax = sns.barplot(x='Potential Deals', y='Needs', data=top_5, palette='viridis')
+    
+    plt.title('Top 5 Missed Product Opportunities', fontsize=12, fontweight='bold')
+    plt.xlabel('Missed Customers')
+    plt.ylabel('')
+    sns.despine(left=True, bottom=True)
+    
+    temp_file = NamedTemporaryFile(delete=False, suffix=".png")
+    plt.savefig(temp_file.name, bbox_inches='tight', dpi=150)
+    plt.close()
+    return temp_file.name
+
+class AuditReport(FPDF):
+    def __init__(self, tier):
+        super().__init__()
+        self.tier = tier
+
+    def header(self):
+        if self.page_no() > 1:
+            self.set_font('Arial', 'B', 9)
+            self.set_text_color(180, 180, 180)
+            self.cell(0, 10, 'ProfitGuard AI - Strategic Growth Audit', 0, 0, 'L')
+            self.cell(0, 10, f'Page {self.page_no()}', 0, 1, 'R')
+            self.line(10, 20, 200, 20)
+            self.ln(5)
+
+    def footer(self):
+        self.set_y(-15)
+        self.set_font('Arial', 'I', 8)
+        self.set_text_color(150, 150, 150)
+        self.cell(0, 10, f'Confidential Analysis | Generated by ProfitGuard AI', 0, 0, 'C')
+
+    def draw_locked_box(self, height=40, text="PREMIUM FEATURE LOCKED"):
+        x = self.get_x()
+        y = self.get_y()
+        self.set_fill_color(245, 245, 245) # Light Grey
+        self.rect(x, y, 190, height, 'F')
+        
+        self.set_y(y + (height/2) - 5)
+        self.set_font('Arial', 'B', 12)
+        self.set_text_color(100, 100, 100)
+        self.cell(0, 10, f"🔒 {text}", 0, 1, 'C')
+        
+        self.set_font('Arial', '', 9)
+        self.ln(5)
+        self.cell(0, 10, "Upgrade to Audit Pro to unlock this data.", 0, 1, 'C')
+        self.set_y(y + height + 10) # Reset cursor below box
+
+    def add_watermark(self):
+        if self.tier == 'free':
+            self.set_font('Arial', 'B', 60)
+            self.set_text_color(240, 240, 240)
+            with self.rotation(45, 105, 148):
+                self.text(40, 190, "FREE PREVIEW")
+            self.set_text_color(0, 0, 0) # Reset
+            self.set_font('Arial', '', 10) # Reset
+
+def create_professional_pdf(rfm_df, upsell_df, seasonal_data, forecast_val, user_name, company_name, tier):
+    pdf = AuditReport(tier)
+    pdf.set_auto_page_break(auto=True, margin=15)
+    
+    # --- PAGE 1: COVER PAGE (Perfectly Centered) ---
+    pdf.add_page()
+    pdf.set_fill_color(24, 33, 47) # Navy Blue
+    pdf.rect(0, 0, 210, 297, 'F') 
+    
+    pdf.ln(90)
+    pdf.set_font('Arial', 'B', 36)
+    pdf.set_text_color(255, 255, 255)
+    pdf.cell(0, 15, 'REVENUE', 0, 1, 'C')
+    pdf.cell(0, 15, 'INTELLIGENCE AUDIT', 0, 1, 'C')
+    
+    pdf.ln(20)
+    pdf.set_font('Arial', '', 12)
+    pdf.set_text_color(200, 200, 200)
+    # Ensure company name is a string to prevent errors
+    comp_str = str(company_name).upper() if company_name else "VALUED CLIENT"
+    pdf.cell(0, 10, f'PREPARED FOR: {comp_str}', 0, 1, 'C')
+    pdf.cell(0, 10, f'DATE: {datetime.now().strftime("%B %d, %Y")}', 0, 1, 'C')
+    
+    if tier == 'free':
+        pdf.ln(10)
+        pdf.set_text_color(255, 100, 100)
+        pdf.set_font('Arial', 'B', 14)
+        pdf.cell(0, 10, "[ FREE PREVIEW MODE ]", 0, 1, 'C')
+
+    # --- PAGE 2: EXECUTIVE SUMMARY (Side-by-Side Alignment Fixed) ---
+    pdf.add_page()
+    pdf.add_watermark()
+    
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_font('Arial', 'B', 18)
+    pdf.cell(0, 2.5, '1. Executive Health Score', 0, 1)
+    pdf.line(10, 30, 200, 30)
+    pdf.ln(10)
+    
+    # -- METRICS & CHART LAYOUT --
+    total_rev = rfm_df['Total_LTV'].sum()
+    risk_rev = rfm_df[rfm_df['Churn_Risk'] > 75]['Total_LTV'].sum()
+    
+    # Capture starting Y position for side-by-side alignment
+    start_y = pdf.get_y()
+    
+    # 1. LEFT COLUMN: Text Metrics (Width = 100mm)
+    pdf.set_left_margin(10)
+    pdf.set_font('Arial', '', 11)
+    
+    # Metric 1
+    pdf.set_fill_color(240, 248, 255) # Light Blue
+    pdf.cell(90, 10, "  Total Revenue Analyzed", 0, 1, 'L', True)
+    pdf.set_font('Arial', 'B', 12)
+    pdf.cell(90, 10, f"  INR {total_rev:,.0f}", 0, 1, 'L', True)
+    pdf.ln(4)
+    
+    # Metric 2
+    pdf.set_font('Arial', '', 11)
+    pdf.cell(90, 10, "  Revenue at Churn Risk", 0, 1, 'L', True)
+    pdf.set_font('Arial', 'B', 12)
+    pdf.set_text_color(200, 0, 0) # Red Text
+    pdf.cell(90, 10, f"  INR {risk_rev:,.0f}", 0, 1, 'L', True)
+    pdf.set_text_color(0, 0, 0)
+    
+    # 2. RIGHT COLUMN: Donut Chart (Width = 90mm)
+    # Reset Y to top, Move X to 110
+    pdf.set_y(start_y) 
+    pdf.set_x(110)
+    
+    try:
+        risk_chart = create_risk_chart(total_rev, risk_rev)
+        if risk_chart:
+            # Place image at X=115 to centre it in the right column
+            pdf.image(risk_chart, x=115, y=start_y, w=75) 
+    except:
+        pdf.cell(80, 40, "Chart Error", 1, 1, 'C')
+
+    # Reset Cursor to below the chart/metrics
+    pdf.set_y(start_y + 85) # Move down explicitly (Chart height approx 80)
+    pdf.set_x(10) # Reset margin
+    
+    # 2. Forecast (Locked if Free)
+    pdf.set_font('Arial', '', 11)
+    pdf.cell(95, 12, "  Predicted Next Month Revenue", 1, 0, 'L', True)
+    pdf.set_font('Arial', 'B', 11)
+    
+    if tier == 'free':
+        pdf.set_text_color(150, 150, 150)
+        pdf.cell(95, 12, " LOCKED ", 1, 1, 'R', True)
+        pdf.set_text_color(0, 0, 0)
+    else:
+        val = f" INR {forecast_val:,.0f}" if forecast_val else " Not Enough Data"
+        pdf.cell(95, 12, val, 1, 1, 'R', True)
+    # pdf.ln(14)
+    
+    # 3. Risk
+    pdf.set_font('Arial', '', 11)
+    pdf.set_fill_color(255, 235, 238) # Red background
+    pdf.set_text_color(200, 0, 0)
+    pdf.cell(95, 12, "  Revenue at Churn Risk", 1, 0, 'L', True)
+    pdf.set_font('Arial', 'B', 11)
+    pdf.cell(95, 12, f" INR {risk_rev:,.0f}", 1, 1, 'R', True)
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(20)
+
+    # Seasonality Section
+    pdf.set_font('Arial', 'B', 14)
+    pdf.cell(0, 10, 'Seasonal Revenue Strategy', 0, 1)
+    pdf.ln(2)
+    
+    if tier == 'free':
+        pdf.draw_locked_box(height=50, text="SEASONALITY CHART LOCKED")
+    else:
+        # PAID TIER: SHOW CHART + TEXT
+        pdf.set_font('Arial', '', 10)
+        if seasonal_data is not None:
+            best_mo = seasonal_data.loc[seasonal_data['Total_LTV'].idxmax()]['Month'] 
+            worst_mo = seasonal_data.loc[seasonal_data['Total_LTV'].idxmin()]['Month']
+            pdf.multi_cell(0, 6, f"Insight: Your sales peak in {best_mo} and dip in {worst_mo}. Use this chart to plan inventory.")
+            pdf.ln(5)
+            
+            # INSERT CHART
+            try:
+                chart_path = create_seasonality_chart(seasonal_data)
+                if chart_path:
+                    pdf.image(chart_path, x=15, w=180)
+                    pdf.ln(5)
+            except Exception as e:
+                pdf.cell(0, 10, f"Chart could not be generated: {e}", 0, 1)
+        else:
+            pdf.cell(0, 10, "Insufficient data for seasonality.", 0, 1)
+
+    # --- PAGE 3: HIGH RISK CLIENTS (Table Alignment Fixed) ---
+    pdf.add_page()
+    pdf.add_watermark()
+    
+    pdf.set_font('Arial', 'B', 18)
+    pdf.cell(0, 2.5, '2. Retention Alert (High Risk)', 0, 1)
+    pdf.line(10, 30, 200, 30)
+    pdf.ln(10)
+    
+    # Table Header Definition (Total Width = 190mm)
+    w_name = 85
+    w_ltv = 40
+    w_days = 30
+    w_status = 35
+    
+    pdf.set_font('Arial', 'B', 10)
+    pdf.set_fill_color(200, 50, 50)
+    pdf.set_text_color(255, 255, 255)
+    pdf.cell(w_name, 10, 'Customer Name', 1, 0, 'L', True)
+    pdf.cell(w_ltv, 10, 'LTV (INR)', 1, 0, 'C', True)
+    pdf.cell(w_days, 10, 'Days', 1, 0, 'C', True)
+    pdf.cell(w_status, 10, 'Status', 1, 1, 'C', True)
+    
+    pdf.set_font('Arial', '', 9)
+    pdf.set_text_color(0, 0, 0)
+    # pdf.ln(10)
+    
+    # Table Rows
+    risk_df = rfm_df[rfm_df['Churn_Risk'] > 75].sort_values('Total_LTV', ascending=False)
+    if tier == 'free': risk_df = risk_df.head(10)
+    else: risk_df = risk_df.head(25)
+
+    for _, row in risk_df.iterrows():
+        # Truncate strings to prevent overlap
+        name = str(row['Customer']).replace('"', '')[:35] # Limit to 35 chars
+        ltv = f"{row['Total_LTV']:,.0f}"
+        days = str(int(row['Recency_Days']))
+        
+        pdf.cell(w_name, 8, name, 1)
+        pdf.cell(w_ltv, 8, ltv, 1, 0, 'R')
+        pdf.cell(w_days, 8, days, 1, 0, 'C')
+        
+        pdf.set_text_color(200, 0, 0)
+        pdf.cell(w_status, 8, "CRITICAL", 1, 1, 'C')
+        pdf.set_text_color(0, 0, 0)
+        
+    if tier == 'free':
+        pdf.ln(5)
+        pdf.set_font('Arial', 'I', 10)
+        pdf.cell(0, 10, "... Upgrade to Audit Pro for full list.", 0, 1, 'C')
+
+    # --- PAGE 4: GROWTH OPPORTUNITIES (Table Alignment Fixed) ---
+    pdf.add_page()
+    pdf.add_watermark()
+    
+    pdf.set_font('Arial', 'B', 18)
+    pdf.cell(0, 2.5, '3. Growth Opportunities', 0, 1)
+    pdf.line(10, 30, 200, 30)
+    pdf.ln(10)
+    
+    if tier == 'free':
+        pdf.draw_locked_box(height=80, text="GROWTH ENGINE LOCKED")
+    else:
+        if upsell_df is not None and not upsell_df.empty:
+            # 1. Chart (Upsell Bar)
+            try:
+                upsell_chart = create_upsell_chart(upsell_df)
+                if upsell_chart:
+                    pdf.image(upsell_chart, x=10, w=190)
+                    pdf.ln(5)
+            except: pass
+            
+            # 2. Table Header (Total Width = 190mm)
+            w_bought = 70
+            w_pitch = 70
+            w_pot = 50
+            
+            pdf.ln(5)
+            pdf.set_font('Arial', 'B', 9)
+            pdf.set_fill_color(46, 125, 50) # Green
+            pdf.set_text_color(255, 255, 255)
+            
+            pdf.cell(w_bought, 10, 'If they bought...', 1, 0, 'L', True)
+            pdf.cell(w_pitch, 10, 'Pitch this Upsell...', 1, 0, 'L', True)
+            pdf.cell(w_pot, 10, 'Opportunity', 1, 1, 'C', True)
+            
+            pdf.set_font('Arial', '', 9)
+            pdf.set_text_color(0, 0, 0)
+            # pdf.ln(10)
+            
+            for _, row in upsell_df.head(15).iterrows():
+                # Extract values safely
+                bought = str(row.get('If they bought...', row.get('Bought', '')))[:35]
+                needs = str(row.get('They likely need...', row.get('Needs', '')))[:35]
+                
+                # Format 'Potential' properly
+                raw_count = row.get('Missed Sales Count', row.get('Potential Deals', 0))
+                pot_str = f"{raw_count} Clients"
+                
+                pdf.cell(w_bought, 8, bought, 1)
+                pdf.cell(w_pitch, 8, needs, 1)
+                pdf.cell(w_pot, 8, pot_str, 1, 1, 'C')
+
+        else:
+            pdf.cell(0, 10, "No significant cross-sell data found.", 0, 1)
+
+    return bytes(pdf.output(dest='S'))
 # ────────────────────────────────────────────────
 #  3. LOGIN PAGE UI
 # ────────────────────────────────────────────────
@@ -300,6 +859,7 @@ def main_dashboard():
     with st.sidebar:
         st.markdown(f"👤 **{user['name']}**")
         st.caption(f"{user['company']} • {st.session_state.tier.upper()}")
+        
         st.divider()
         
         # Upgrade System
@@ -317,7 +877,8 @@ def main_dashboard():
         if st.button("Logout"):
             st.session_state.logged_in = False
             st.rerun()
-
+        
+        
     # Main Content
     st.title("ProfitGuard AI")
     st.markdown(f"### {tier_info['title']}")
@@ -335,7 +896,75 @@ def main_dashboard():
             st.error(err)
         else:
             rfm = res['rfm']
-            
+            cols = res['cols']
+            with st.sidebar:
+                st.subheader("📥 Audit Report")
+        
+                # Determine button label based on Tier
+                if st.session_state.tier == 'free':
+                    label = "📄 Download PDF (Free Preview)"
+                else:
+                    label = "📄 Download Full Audit PDF"
+                    
+                if st.button(label):
+                    with st.spinner("Generating Report..."):
+                        # 1. GATHER DATA (Recalculate or pull from session)
+                        rfm = res['rfm']
+                        seasonal_data = None
+                        forecast_val = 0
+                        upsell_df = pd.DataFrame()
+                        
+                        # Only calculate advanced metrics if tier permits OR for hidden masking logic
+                        # Actually, we calculate them but mask them in the PDF function
+                        if len(res['df']) > 10:
+                            # seasonal_data, _, _ = get_seasonality_analysis(res['df'], cols['d'], cols['a'])
+                            try:
+                                # Make sure columns match what the chart function expects ('Month', 'Total_LTV')
+                                seasonal_data, _, _ = get_seasonality_analysis(res['df'], cols['d'], cols['a'])
+                                seasonal_data.columns = ['Month_Num', 'Month', 'Total_LTV'] 
+                            except:
+                                pass
+                            forecast_val = get_aggregate_forecast(res['df'], cols['d'], cols['a'])
+                        
+                        if cols['p']:
+                            # 1. Get the Raw Result
+                            upsell_result = generate_cross_sell(res['df'], cols['c'], cols['p'])
+                            
+                            # 2. Handle Tuple vs DataFrame (Safety Check)
+                            if isinstance(upsell_result, tuple):
+                                upsell_df = upsell_result[0]
+                            else:
+                                upsell_df = upsell_result
+                            
+                            # 3. RENAME COLUMNS (Crucial Fix)
+                            # The PDF expects 'Bought', 'Needs', 'Potential Deals'
+                            if not upsell_df.empty:
+                                # Check existing names and map them
+                                # Option A: If your function returns ["If they bought...", "They likely need...", ...]
+                                if "If they bought..." in upsell_df.columns:
+                                    upsell_df = upsell_df.rename(columns={
+                                        "If they bought...": "Bought",
+                                        "They likely need...": "Needs",
+                                        "Missed Sales Count": "Potential Deals", # Or "Potential Sales"
+                                        "Potential Sales": "Potential Deals"
+                                    })
+                        # 2. GENERATE PDF WITH TIER
+                        pdf_bytes = create_professional_pdf(
+                            rfm_df=rfm,
+                            upsell_df=upsell_df,
+                            seasonal_data=seasonal_data,
+                            forecast_val=forecast_val,
+                            user_name=user['name'],
+                            company_name=user['company'],
+                            tier=st.session_state.tier # <--- PASS TIER HERE
+                        )
+                    
+                    st.download_button(
+                        label="⬇️ Click to Save",
+                        data=pdf_bytes,
+                        file_name=f"ProfitGuard_Report_{st.session_state.tier}.pdf",
+                        mime="application/pdf"
+                    )
             # TIER LOGIC: Filter Data
             display_rfm = rfm.copy()
             if tier_info['max_customers']:
@@ -352,7 +981,7 @@ def main_dashboard():
             k3.caption("High Churn Probability")
 
             # Tabs
-            tabs = st.tabs(["📉 Retention", "🔮 Predictions", "📦 Inventory/Cross-Sell"])
+            tabs = st.tabs(["📉 Retention", "🔮 Predictions", "📦 Inventory/Cross-Sell","🧪 Strategy"])
             
             with tabs[0]:
                 st.subheader("High Priority Call List")
@@ -363,12 +992,110 @@ def main_dashboard():
                     .background_gradient(subset=['Churn_Risk'], cmap='Reds'),
                     use_container_width=True
                 )
+                st.divider()
+                st.subheader("📅 Cohort Retention Analysis")
+                if st.session_state.tier in ['tier1', 'tier2']:
+                    cohort_matrix = get_cohort_analysis(res['df'], cols['c'], cols['d'])
+                    
+                    # Display as a Heatmap styled dataframe
+                    st.dataframe(
+                        cohort_matrix.style.format("{:.0%}").background_gradient(cmap="Blues", axis=None),
+                        use_container_width=True
+                    )
+                    st.caption("Read this: 'In Month 0 (start), 100% are here. In Month 1, X% returned.'")
+                else:
+                    st.info("🔒 Upgrade to Audit Pro to see your Customer Retention Heatmap.")
 
             with tabs[1]:
                 if tier_info['allow_clv']:
                     st.subheader("AI Revenue Forecast (Next 30 Days)")
                     # Placeholder for advanced model
-                    st.info("✅ Prediction Module Active. (Connect ML model here)")
+                    # st.info("✅ Prediction Module Active. (Connect ML model here)")
+                    # Check if we have enough data to run the model
+                    if len(res['df']) < 10:
+                        st.warning("⚠️ Not enough data to train the AI model. Please upload a larger dataset.")
+                    else:
+                        with st.spinner("Training AI Models (BG/NBD + Gamma-Gamma)..."):
+                            try:
+                                # Retrieve raw data and column names from the processed result
+                                raw_df = res['df'] 
+                                c_col = res['cols']['c'] # Customer Column
+                                d_col = res['cols']['d'] # Date Column
+                                a_col = res['cols']['a'] # Amount Column
+
+                                # Run the Prediction Function
+                                preds = get_predictive_clv(raw_df, c_col, d_col, a_col)
+                                
+                                # Display Top Predicted Customers
+                                top_pred = preds.head(10)[['predicted_purchases_30d', 'predicted_clv']]
+                                
+                                st.success("✅ AI Analysis Complete")
+                                st.markdown("### Customers Most Likely to Buy Next Month")
+                                
+                                st.dataframe(
+                                    top_pred.style.format({
+                                        'predicted_purchases_30d': '{:.2f}', 
+                                        'predicted_clv': '₹{:,.2f}'
+                                    }).background_gradient(cmap='Greens'),
+                                    use_container_width=True
+                                )
+                                
+                                # Download Button for Full Forecast
+                                st.download_button(
+                                    "📥 Download Full Prediction Report",
+                                    preds.to_csv().encode('utf-8'),
+                                    "ai_revenue_forecast.csv",
+                                    "text/csv"
+                                )
+                                
+                            except Exception as e:
+                                st.error(f"Model Error: {str(e)}")
+                                st.caption("Ensure your data has valid positive transaction values.")
+                        st.subheader("🔮 Financial Outlook & Intelligence")
+                
+                        # 1. Calculate Insights
+                        with st.spinner("Crunching numbers..."):
+                            preds_clv = get_predictive_clv(res['df'], cols['c'], cols['d'], cols['a'])
+                            next_mo_rev = get_aggregate_forecast(res['df'], cols['d'], cols['a'])
+                            seasonal_data, best_mo, worst_mo = get_seasonality_analysis(res['df'], cols['d'], cols['a'])
+
+                        # 2. Display Top Level Metrics
+                        col_pred1, col_pred2, col_pred3 = st.columns(3)
+                        
+                        if next_mo_rev:
+                            col_pred1.metric("📅 Next Month Forecast", f"₹{next_mo_rev:,.0f}", help="Predicted total revenue based on trend.")
+                        
+                        if best_mo is not None:
+                            col_pred2.metric("🔥 Best Season", best_mo['Month'], f"Avg: ₹{best_mo[cols['a']]:,.0f}")
+                            col_pred3.metric("❄️ Slowest Season", worst_mo['Month'], f"Avg: ₹{worst_mo[cols['a']]:,.0f}", delta_color="inverse")
+
+                        st.divider()
+
+                        # 3. Two-Column Layout: Seasonality Chart & Customer List
+                        c1 = st.columns([1])
+
+                        # with c1:
+                        st.markdown("### 📅 Seasonal Trends")
+                        if seasonal_data is not None:
+                            chart = alt.Chart(seasonal_data).mark_bar(color='#2196F3').encode(
+                                x=alt.X('Month:N', sort=None, title=None),
+                                y=alt.Y(cols['a'], title='Total Revenue'),
+                                tooltip=['Month', cols['a']]
+                            ).properties(height=300)
+                            st.altair_chart(chart, use_container_width=True)
+                            st.caption("💡 **Tip:** Stock up before the blue bars peak.")
+
+                        # with c2:
+                        #     st.markdown("### 👥 Top Customers (Next 30 Days)")
+                        #     top_pred = preds_clv.head(8)[['predicted_purchases_30d', 'predicted_clv']]
+                        #     st.dataframe(
+                        #         top_pred.style.format({
+                        #             'predicted_purchases_30d': '{:.1f} Orders', 
+                        #             'predicted_clv': '₹{:,.0f}'
+                        #         }).background_gradient(cmap='Greens'),
+                        #         use_container_width=True
+                        #     )
+                        #     st.caption("Customers with highest probability to buy next month.")
                 else:
                     st.markdown("### 🔒 Locked Feature")
                     st.warning("Upgrade to **Audit Pro** to see which customers will buy next month.")
@@ -376,11 +1103,70 @@ def main_dashboard():
             with tabs[2]:
                 if tier_info['allow_cross_sell']:
                     st.subheader("Upsell Opportunities")
-                    st.success("✅ Basket Analysis Active")
+                    st.subheader("📦 Inventory & Cross-Sell Intelligence")
+                    
+                    # Check if Product Column exists (cols['p'] comes from process_data)
+                    if not cols['p']:
+                        st.error("❌ 'Product' or 'Item' column not found in CSV.")
+                        st.info("Please ensure your CSV has a column named 'Product Name', 'Item Description', or 'SKU'.")
+                    else:
+                        with st.spinner("Analyzing purchase patterns..."):
+                            # Run the Cross-Sell Logic
+                            upsell_df, err = generate_cross_sell(res['df'], cols['c'], cols['p'])
+                            
+                            if err:
+                                st.warning(err)
+                            else:
+                                st.success(f"✅ Found {len(upsell_df)} Upsell Opportunities")
+                                
+                                # Display the opportunities
+                                st.dataframe(
+                                    upsell_df,
+                                    column_config={
+                                        "Potential Sales": st.column_config.NumberColumn(
+                                            "Missed Customers",
+                                            help="Number of customers who bought Item A but missed Item B"
+                                        )
+                                    },
+                                    use_container_width=True,
+                                    hide_index=True
+                                )
+                                
+                                st.markdown("---")
+                                st.caption("💡 **Strategy:** Call the customers listed in the right column and offer them the 'Likely Need' product.")
                 else:
                     st.markdown("### 🔒 Locked Feature")
                     st.warning("Upgrade to **Audit Pro** to see Product Recommendations.")
-
+            with tabs[3]:
+                if st.session_state.tier == "tier2":
+                    # Feature 1: The Simulator
+                    render_scenario_simulator(res['rfm'])
+                    
+                    st.divider()
+                    
+                    # Feature 2: PDF Reporting (From your standalone file)
+                    st.subheader("📄 Executive Reporting")
+                    st.write("Download professional audit reports for your sales team.")
+                    
+                    # (Mock PDF generation for speed - connect your full PDF function here)
+                    if st.button("📥 Generate Board Report"):
+                        with st.spinner("Compiling PDF..."):
+                            # logic from app_stanalone.py would go here
+                            st.success("Report Generated! (Connect PDF logic here)")
+                            
+                else:
+                    # THE UPSELL LOCK SCREEN
+                    st.empty()
+                    st.info("💎 **Growth Partner Feature**")
+                    st.markdown("""
+                    ### Unlock Enterprise Strategy Tools
+                    
+                    **Tier 2 Users Get:**
+                    * ✅ **What-If Simulator:** Calculate impact of price changes & churn reduction.
+                    * ✅ **PDF Audit Reports:** Download branded reports for your sales team.
+                    * ✅ **Dedicated Account Manager.**
+                    """)
+                    st.warning("Current Plan: " + tier_info['title'])
 # ────────────────────────────────────────────────
 #  5. APP ENTRY POINT
 # ────────────────────────────────────────────────
