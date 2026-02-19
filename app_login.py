@@ -27,9 +27,9 @@ from tempfile import NamedTemporaryFile
 
 
 def send_email_alert(name, company, phone, category):
-    sender_email = "profitguardai@gmail.com"
-    sender_password = "wulfnrpomptjttqo" # Paste the 16-digit App Password
-    receiver_email = "profitguardai@gmail.com"  # Send to yourself
+    sender_email = st.secrets["email"]["address"]
+    sender_password = st.secrets["email"]["password"] # Paste the 16-digit App Password
+    receiver_email = st.secrets["email"]["address"]  # Send to yourself
 
     msg_body = f"""
     NEW USER SIGNUP:
@@ -471,6 +471,24 @@ def create_upsell_chart(upsell_df):
     plt.close()
     return temp_file.name
 
+def increment_download_count(email):
+    """Updates the download count in DB and Session State."""
+    conn = get_db_connection()
+    try:
+        with conn.session as session:
+            session.execute(
+                text("UPDATE users SET pdf_downloads = Coalesce(pdf_downloads, 0) + 1 WHERE email = :email;"),
+                {"email": email}
+            )
+            session.commit()
+            
+        # Update local session immediately so the UI refreshes
+        current = st.session_state.user.get('pdf_downloads', 0)
+        st.session_state.user['pdf_downloads'] = current + 1
+        
+    except Exception as e:
+        print(f"Error updating count: {e}")
+
 class AuditReport(FPDF):
     def __init__(self, tier):
         super().__init__()
@@ -500,26 +518,60 @@ class AuditReport(FPDF):
         self.set_y(y + (height/2) - 5)
         self.set_font('Arial', 'B', 12)
         self.set_text_color(100, 100, 100)
-        self.cell(0, 10, f"🔒 {text}", 0, 1, 'C')
+        self.cell(0, 10, f"[LOCKED] {text}", 0, 1, 'C')
         
         self.set_font('Arial', '', 9)
         self.ln(5)
         self.cell(0, 10, "Upgrade to Audit Pro to unlock this data.", 0, 1, 'C')
         self.set_y(y + height + 10) # Reset cursor below box
 
+    # def add_watermark(self):
+    #     if self.tier == 'free':
+    #         self.set_font('Arial', 'B', 60)
+    #         self.set_text_color(240, 240, 240)
+    #         with self.rotation(45, 105, 148):
+    #             self.text(40, 190, "FREE PREVIEW")
+    #         self.set_text_color(0, 0, 0) # Reset
+    #         self.set_font('Arial', '', 10) # Reset
     def add_watermark(self):
         if self.tier == 'free':
-            self.set_font('Arial', 'B', 60)
-            self.set_text_color(240, 240, 240)
-            with self.rotation(45, 105, 148):
-                self.text(40, 190, "FREE PREVIEW")
-            self.set_text_color(0, 0, 0) # Reset
-            self.set_font('Arial', '', 10) # Reset
+            self.set_font('Arial', 'B', 25) # Size of the repeating text
+            self.set_text_color(200, 200, 200) # Light Grey (Visible but readable)
+            
+            # Loop vertically and horizontally to cover the A4 page (approx 210x297mm)
+            # We step by 80mm to create a grid pattern
+            for x_pos in range(0, 250, 80):
+                for y_pos in range(0, 350, 80):
+                    # Rotate 45 degrees around the current position (x_pos, y_pos)
+                    with self.rotation(45, x_pos, y_pos):
+                        self.text(x_pos, y_pos, "FREE PREVIEW")
+            
+            # Reset colors/fonts for the actual report content
+            self.set_text_color(0, 0, 0)
+            self.set_font('Arial', '', 10)
 
 def create_professional_pdf(rfm_df, upsell_df, seasonal_data, forecast_val, user_name, company_name, tier):
     pdf = AuditReport(tier)
     pdf.set_auto_page_break(auto=True, margin=15)
+    risk_value = rfm_df[rfm_df['Churn_Risk'] > 75]['Total_LTV'].sum()
     
+    # B. Calculate Upsell Value (Money you find them)
+    # We estimate 'Potential Deals' * 'Average Ticket Size' (Approx ₹5,000 per deal if unknown)
+    upsell_value = 0
+    if upsell_df is not None and not upsell_df.empty:
+        # Sum of (Potential Deals * Estimated Unit Price)
+        # Assuming average order value is roughly total_revenue / total_transactions
+        avg_order_val = rfm_df['Total_LTV'].sum() / rfm_df['Frequency'].sum() if rfm_df['Frequency'].sum() > 0 else 2000
+        
+        # Check if 'Potential Deals' column exists (it might be named 'Missed Sales Count')
+        count_col = 'Potential Deals' if 'Potential Deals' in upsell_df.columns else 'Missed Sales Count'
+        
+        if count_col in upsell_df.columns:
+            total_missed_deals = upsell_df[count_col].sum()
+            upsell_value = total_missed_deals * avg_order_val
+
+    # C. TOTAL VALUE
+    total_audit_value = risk_value + upsell_value
     # --- PAGE 1: COVER PAGE (Perfectly Centered) ---
     pdf.add_page()
     pdf.set_fill_color(24, 33, 47) # Navy Blue
@@ -538,7 +590,25 @@ def create_professional_pdf(rfm_df, upsell_df, seasonal_data, forecast_val, user
     comp_str = str(company_name).upper() if company_name else "VALUED CLIENT"
     pdf.cell(0, 10, f'PREPARED FOR: {comp_str}', 0, 1, 'C')
     pdf.cell(0, 10, f'DATE: {datetime.now().strftime("%B %d, %Y")}', 0, 1, 'C')
+    # --- NEW: DISPLAY THE MONEY VALUE ---
+    pdf.ln(20)
+    pdf.set_fill_color(46, 125, 50) # Green Box
+    pdf.set_draw_color(255, 255, 255)
     
+    # Center the box (approx width 120)
+    x_pos = (210 - 140) / 2
+    y_pos = pdf.get_y()
+    
+    pdf.rect(x_pos, y_pos, 140, 35, 'FD') # Filled with border
+    
+    pdf.set_y(y_pos + 5)
+    pdf.set_font('Arial', 'B', 10)
+    pdf.set_text_color(255, 255, 255)
+    pdf.cell(0, 10, "TOTAL IDENTIFIED OPPORTUNITY", 0, 1, 'C')
+    
+    pdf.set_font('Arial', 'B', 22)
+    pdf.cell(0, 15, f"INR {total_audit_value:,.0f}", 0, 1, 'C')
+    # ------------------------------------
     if tier == 'free':
         pdf.ln(10)
         pdf.set_text_color(255, 100, 100)
@@ -547,7 +617,7 @@ def create_professional_pdf(rfm_df, upsell_df, seasonal_data, forecast_val, user
 
     # --- PAGE 2: EXECUTIVE SUMMARY (Side-by-Side Alignment Fixed) ---
     pdf.add_page()
-    pdf.add_watermark()
+    # pdf.add_watermark()
     
     pdf.set_text_color(0, 0, 0)
     pdf.set_font('Arial', 'B', 18)
@@ -650,8 +720,9 @@ def create_professional_pdf(rfm_df, upsell_df, seasonal_data, forecast_val, user
             pdf.cell(0, 10, "Insufficient data for seasonality.", 0, 1)
 
     # --- PAGE 3: HIGH RISK CLIENTS (Table Alignment Fixed) ---
-    pdf.add_page()
     pdf.add_watermark()
+    pdf.add_page()
+    # pdf.add_watermark()
     
     pdf.set_font('Arial', 'B', 18)
     pdf.cell(0, 2.5, '2. Retention Alert (High Risk)', 0, 1)
@@ -701,8 +772,9 @@ def create_professional_pdf(rfm_df, upsell_df, seasonal_data, forecast_val, user
         pdf.cell(0, 10, "... Upgrade to Audit Pro for full list.", 0, 1, 'C')
 
     # --- PAGE 4: GROWTH OPPORTUNITIES (Table Alignment Fixed) ---
-    pdf.add_page()
     pdf.add_watermark()
+    pdf.add_page()
+    # pdf.add_watermark()
     
     pdf.set_font('Arial', 'B', 18)
     pdf.cell(0, 2.5, '3. Growth Opportunities', 0, 1)
@@ -754,7 +826,60 @@ def create_professional_pdf(rfm_df, upsell_df, seasonal_data, forecast_val, user
 
         else:
             pdf.cell(0, 10, "No significant cross-sell data found.", 0, 1)
+    # --- PAGE 5: ACTIONABLE CALL LIST (New Section) ---
+    pdf.add_watermark()
+    pdf.add_page()
+    
+    pdf.set_font('Arial', 'B', 18)
+    pdf.set_text_color(0, 0, 0)
+    pdf.cell(0, 2.5, '4. High Priority Call List', 0, 1)
+    pdf.line(10, 30, 200, 30)
+    pdf.ln(10)
 
+    pdf.set_font('Arial', '', 11)
+    pdf.multi_cell(0, 6, "Action Required: The following customers have a high churn probability (>70%). Contact them immediately with a re-engagement offer.")
+    pdf.ln(5)
+
+    # Table Header
+    w_name = 90
+    w_rec = 40
+    w_risk = 40
+    
+    pdf.set_fill_color(220, 220, 220)
+    pdf.set_font('Arial', 'B', 10)
+    pdf.cell(w_name, 10, 'Customer / Company', 1, 0, 'L', True)
+    pdf.cell(w_rec, 10, 'Days Inactive', 1, 0, 'C', True)
+    pdf.cell(w_risk, 10, 'Risk Level', 1, 1, 'C', True)
+    
+    # Table Rows
+    pdf.set_font('Arial', '', 10)
+    call_list = rfm_df[rfm_df['Churn_Risk'] > 70].sort_values('Churn_Risk', ascending=False)
+    
+    # Tier limit
+    if tier == 'free': call_list = call_list.head(5)
+    else: call_list = call_list.head(30)
+
+    if call_list.empty:
+        pdf.cell(0, 10, "No high-risk customers detected.", 1, 1, 'C')
+    else:
+        for _, row in call_list.iterrows():
+            name = str(row['Customer'])[:35]
+            days = str(int(row['Recency_Days']))
+            risk = f"{row['Churn_Risk']:.1f}%"
+            
+            pdf.cell(w_name, 8, name, 1)
+            pdf.cell(w_rec, 8, days, 1, 0, 'C')
+            pdf.set_text_color(200, 0, 0)
+            pdf.cell(w_risk, 8, risk, 1, 1, 'C')
+            pdf.set_text_color(0, 0, 0)
+
+    if tier == 'free':
+        pdf.ln(5)
+        pdf.set_font('Arial', 'I', 10)
+        pdf.cell(0, 10, "... List truncated. Upgrade to Audit Pro for full list.", 0, 1, 'C')
+
+    # Return statement remains at the very end
+    # return bytes(pdf.output(dest='S'))
     return bytes(pdf.output(dest='S'))
 # ────────────────────────────────────────────────
 #  3. LOGIN PAGE UI
@@ -772,9 +897,34 @@ def render_login_page():
     </style>
     """, unsafe_allow_html=True)
 
+    # Hide the Streamlit header and footer
+    hide_st_style = """
+            <style>
+            /* Hides the entire top header bar */
+            
+            
+            /* Specifically hides the "Made with Streamlit" footer */
+            footer {
+                visibility: hidden !important;
+            }
+
+            /* Optional: Hides the "Manage App" floating button for you as well */
+            .stAppDeployButton {
+                display: none !important;
+            }
+            .st-emotion-cache-scp8yw{
+            display:none !important;
+            }
+            [data-testid="manage-app-button"]{
+            display:none !important;
+            }
+            </style>
+            """
+    st.markdown(hide_st_style, unsafe_allow_html=True)
+
     st.title("ProfitGuard AI")
     st.markdown("### Distributor Intelligence & Revenue Recovery System")
-    st.caption("Secure Portal • 256-bit Encryption • Hosted in Mumbai")
+    st.caption("Secure Portal • 256-bit Encryption")
 
     tab_login, tab_signup = st.tabs(["🔐 Login", "📝 Start Free Audit"])
 
@@ -852,6 +1002,31 @@ def render_login_page():
 # ────────────────────────────────────────────────
 
 def main_dashboard():
+     # Hide the Streamlit header and footer
+    hide_st_style = """
+            <style>
+            /* Hides the entire top header bar */
+            
+            
+            /* Specifically hides the "Made with Streamlit" footer */
+            footer {
+                visibility: hidden !important;
+            }
+
+            /* Optional: Hides the "Manage App" floating button for you as well */
+            .stAppDeployButton {
+                display: none !important;
+            }
+            .st-emotion-cache-scp8yw{
+            display:none !important;
+            }
+            [data-testid="manage-app-button"]{
+            display:none !important;
+            }
+            </style>
+            """
+    st.markdown(hide_st_style, unsafe_allow_html=True)
+
     user = st.session_state.user
     tier_info = TIERS.get(st.session_state.tier, TIERS['free'])
 
@@ -862,21 +1037,19 @@ def main_dashboard():
         
         st.divider()
         
-        # Upgrade System
-        code = st.text_input("Enter Upgrade Code", type="password")
-        if st.button("Apply Code"):
-            if code.lower() in CODE_MAP:
-                # Update session
-                st.session_state.tier = CODE_MAP[code.lower()]
-                # Update Database (Optional: Add SQL Update here to persist upgrade)
-                st.success(f"Upgraded to {CODE_MAP[code.lower()].upper()}!")
-                st.rerun()
-            else:
-                st.error("Invalid Code")
+        # # Upgrade System
+        # code = st.text_input("Enter Upgrade Code", type="password")
+        # if st.button("Apply Code"):
+        #     if code.lower() in CODE_MAP:
+        #         # Update session
+        #         st.session_state.tier = CODE_MAP[code.lower()]
+        #         # Update Database (Optional: Add SQL Update here to persist upgrade)
+        #         st.success(f"Upgraded to {CODE_MAP[code.lower()].upper()}!")
+        #         st.rerun()
+        #     else:
+        #         st.error("Invalid Code")
         
-        if st.button("Logout"):
-            st.session_state.logged_in = False
-            st.rerun()
+        
         
         
     # Main Content
@@ -899,72 +1072,85 @@ def main_dashboard():
             cols = res['cols']
             with st.sidebar:
                 st.subheader("📥 Audit Report")
-        
-                # Determine button label based on Tier
-                if st.session_state.tier == 'free':
-                    label = "📄 Download PDF (Free Preview)"
+                
+                # --- NEW LOGIC: Check Limits ---
+                current_count = st.session_state.user.get('pdf_downloads', 0)
+                limit = 3
+                is_free = (st.session_state.tier == 'free')
+                
+                # If Limit Reached, Block Access
+                if is_free and current_count >= limit:
+                    st.error(f"🔒 Free Limit Reached ({current_count}/{limit})")
+                    st.caption("Upgrade to Pro for unlimited reports.")
+                
                 else:
-                    label = "📄 Download Full Audit PDF"
-                    
-                if st.button(label):
-                    with st.spinner("Generating Report..."):
-                        # 1. GATHER DATA (Recalculate or pull from session)
-                        rfm = res['rfm']
-                        seasonal_data = None
-                        forecast_val = 0
-                        upsell_df = pd.DataFrame()
+                    # --- EXISTING LOGIC (Wrapped in Else) ---
+                    # Determine button label based on Tier
+                    if is_free:
+                        label = f"📄 Generate PDF (Used {current_count}/{limit})"
+                    else:
+                        label = "📄 Generate Full Audit PDF"
                         
-                        # Only calculate advanced metrics if tier permits OR for hidden masking logic
-                        # Actually, we calculate them but mask them in the PDF function
-                        if len(res['df']) > 10:
-                            # seasonal_data, _, _ = get_seasonality_analysis(res['df'], cols['d'], cols['a'])
-                            try:
-                                # Make sure columns match what the chart function expects ('Month', 'Total_LTV')
-                                seasonal_data, _, _ = get_seasonality_analysis(res['df'], cols['d'], cols['a'])
-                                seasonal_data.columns = ['Month_Num', 'Month', 'Total_LTV'] 
-                            except:
-                                pass
-                            forecast_val = get_aggregate_forecast(res['df'], cols['d'], cols['a'])
-                        
-                        if cols['p']:
-                            # 1. Get the Raw Result
-                            upsell_result = generate_cross_sell(res['df'], cols['c'], cols['p'])
+                    # 1. GENERATE BUTTON
+                    if st.button(label):
+                        with st.spinner("Generating Report..."):
+                            # ... [YOUR EXISTING DATA GATHERING LOGIC REMAINS UNCHANGED] ...
+                            rfm = res['rfm']
+                            seasonal_data = None
+                            forecast_val = 0
+                            upsell_df = pd.DataFrame()
                             
-                            # 2. Handle Tuple vs DataFrame (Safety Check)
-                            if isinstance(upsell_result, tuple):
-                                upsell_df = upsell_result[0]
-                            else:
-                                upsell_df = upsell_result
+                            # (Keep your existing if len(res['df']) > 10 block here...)
+                            if len(res['df']) > 10:
+                                try:
+                                    seasonal_data, _, _ = get_seasonality_analysis(res['df'], cols['d'], cols['a'])
+                                    seasonal_data.columns = ['Month_Num', 'Month', 'Total_LTV'] 
+                                except: pass
+                                forecast_val = get_aggregate_forecast(res['df'], cols['d'], cols['a'])
                             
-                            # 3. RENAME COLUMNS (Crucial Fix)
-                            # The PDF expects 'Bought', 'Needs', 'Potential Deals'
-                            if not upsell_df.empty:
-                                # Check existing names and map them
-                                # Option A: If your function returns ["If they bought...", "They likely need...", ...]
-                                if "If they bought..." in upsell_df.columns:
+                            if cols['p']:
+                                upsell_result = generate_cross_sell(res['df'], cols['c'], cols['p'])
+                                if isinstance(upsell_result, tuple): upsell_df = upsell_result[0]
+                                else: upsell_df = upsell_result
+                                if not upsell_df.empty and "If they bought..." in upsell_df.columns:
                                     upsell_df = upsell_df.rename(columns={
                                         "If they bought...": "Bought",
                                         "They likely need...": "Needs",
-                                        "Missed Sales Count": "Potential Deals", # Or "Potential Sales"
+                                        "Missed Sales Count": "Potential Deals",
                                         "Potential Sales": "Potential Deals"
                                     })
-                        # 2. GENERATE PDF WITH TIER
-                        pdf_bytes = create_professional_pdf(
-                            rfm_df=rfm,
-                            upsell_df=upsell_df,
-                            seasonal_data=seasonal_data,
-                            forecast_val=forecast_val,
-                            user_name=user['name'],
-                            company_name=user['company'],
-                            tier=st.session_state.tier # <--- PASS TIER HERE
+
+                            # Generate PDF
+                            pdf_bytes = create_professional_pdf(
+                                rfm_df=rfm,
+                                upsell_df=upsell_df,
+                                seasonal_data=seasonal_data,
+                                forecast_val=forecast_val,
+                                user_name=user['name'],
+                                company_name=user['company'],
+                                tier=st.session_state.tier
+                            )
+                            
+                            # SAVE TO SESSION STATE (Crucial for Streamlit flow)
+                            st.session_state['pdf_ready'] = pdf_bytes
+
+                    # 2. DOWNLOAD BUTTON (Only appears after generation)
+                    if 'pdf_ready' in st.session_state:
+                        st.download_button(
+                            label="⬇️ Click to Save PDF",
+                            data=st.session_state['pdf_ready'],
+                            file_name=f"ProfitGuard_Report_{st.session_state.tier}.pdf",
+                            mime="application/pdf",
+                            # --- NEW: Increment Count on Click ---
+                            on_click=increment_download_count,
+                            args=(user['email'],)
                         )
+
+                st.divider()
+                if st.button("Logout"):
+                    st.session_state.logged_in = False
+                    st.rerun()  
                     
-                    st.download_button(
-                        label="⬇️ Click to Save",
-                        data=pdf_bytes,
-                        file_name=f"ProfitGuard_Report_{st.session_state.tier}.pdf",
-                        mime="application/pdf"
-                    )
             # TIER LOGIC: Filter Data
             display_rfm = rfm.copy()
             if tier_info['max_customers']:
@@ -1178,5 +1364,6 @@ if 'tier' not in st.session_state:
 
 if st.session_state.logged_in:
     main_dashboard()
+
 else:
     render_login_page()
