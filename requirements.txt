@@ -39,7 +39,7 @@ bcrypt
 sqlalchemy
 psycopg2-binary
 lifetimes
-
+google-genai
 # --- 4. Optional (Keep if you want to test charts locally) ---
 matplotlib
 seaborn
@@ -48,6 +48,7 @@ seaborn
 # We are skipping TensorFlow for now. It is too heavy (500MB+) 
 
 # and will slow down your 10-day launch. We can add it later.
+
 
 
 
