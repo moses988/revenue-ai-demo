@@ -204,48 +204,114 @@ def process_data(df):
         'cols': {'d': date_col, 'c': cust_col, 'a': amt_col, 'p': prod_col}
     }, None
 
+# def get_predictive_clv(df, customer_id_col, date_col, amt_col):
+#     """
+#     Train BG/NBD and Gamma-Gamma models to predict future purchasing behavior.
+#     """
+#     # 1. Filter out non-positive data (returns/errors)
+#     df = df[df[amt_col] > 0]
+
+#     # 2. Transform data into RFM format required by lifetimes
+#     # (frequency, recency, T, monetary_value)
+#     data = summary_data_from_transaction_data(
+#         df, customer_id_col, date_col, 
+#         monetary_value_col=amt_col, 
+#         observation_period_end=df[date_col].max()
+#     )
+    
+#     # 3. Fit BG/NBD Model (Predicts Frequency & Churn)
+#     bgf = BetaGeoFitter(penalizer_coef=0.01)
+#     bgf.fit(data['frequency'], data['recency'], data['T'])
+    
+#     # 4. Predict expected transactions in the next 30 days
+#     data['predicted_purchases_30d'] = bgf.conditional_expected_number_of_purchases_up_to_time(
+#         30, data['frequency'], data['recency'], data['T']
+#     )
+    
+#     # 5. Fit Gamma-Gamma Model (Predicts Average Order Value)
+#     # We only use customers with at least one repeat purchase for this
+#     returning_customers = data[data['frequency'] > 0]
+    
+#     if len(returning_customers) > 0:
+#         ggf = GammaGammaFitter(penalizer_coef=0.01)
+#         ggf.fit(returning_customers['frequency'], returning_customers['monetary_value'])
+        
+#         # Calculate Predicted CLV (Customer Lifetime Value)
+#         data['predicted_clv'] = ggf.customer_lifetime_value(
+#             bgf, data['frequency'], data['recency'], data['T'], 
+#             data['monetary_value'], time=1, discount_rate=0.01 # time=1 means 1 month
+#         )
+#     else:
+#         data['predicted_clv'] = 0
+
+#     return data.sort_values(by='predicted_purchases_30d', ascending=False)
+
 def get_predictive_clv(df, customer_id_col, date_col, amt_col):
     """
-    Train BG/NBD and Gamma-Gamma models to predict future purchasing behavior.
+    Train BG/NBD and Gamma-Gamma models to predict future purchasing behavior
+    with an auto-scaling penalizer to prevent ConvergenceErrors.
     """
     # 1. Filter out non-positive data (returns/errors)
     df = df[df[amt_col] > 0]
 
     # 2. Transform data into RFM format required by lifetimes
-    # (frequency, recency, T, monetary_value)
     data = summary_data_from_transaction_data(
         df, customer_id_col, date_col, 
         monetary_value_col=amt_col, 
         observation_period_end=df[date_col].max()
     )
     
-    # 3. Fit BG/NBD Model (Predicts Frequency & Churn)
-    bgf = BetaGeoFitter(penalizer_coef=0.01)
-    bgf.fit(data['frequency'], data['recency'], data['T'])
+    if len(data) == 0:
+        return pd.DataFrame()
+
+    # List of penalizers to try, from smallest to largest
+    penalizers_to_try = [0.001, 0.01, 0.1, 0.5, 1.0, 5.0, 10.0]
     
+    # 3. Fit BG/NBD Model (Predicts Frequency & Churn)
+    bgf = None
+    for p in penalizers_to_try:
+        try:
+            temp_bgf = BetaGeoFitter(penalizer_coef=p)
+            temp_bgf.fit(data['frequency'], data['recency'], data['T'])
+            bgf = temp_bgf
+            break  # Success! Exit the loop.
+        except Exception:
+            continue  # Failed, try the next higher penalizer
+            
+    if bgf is None:
+        raise RuntimeError("Dataset lacks enough repeat purchase patterns for AI modeling. Please upload a larger dataset.")
+
     # 4. Predict expected transactions in the next 30 days
     data['predicted_purchases_30d'] = bgf.conditional_expected_number_of_purchases_up_to_time(
         30, data['frequency'], data['recency'], data['T']
     )
     
     # 5. Fit Gamma-Gamma Model (Predicts Average Order Value)
-    # We only use customers with at least one repeat purchase for this
     returning_customers = data[data['frequency'] > 0]
     
     if len(returning_customers) > 0:
-        ggf = GammaGammaFitter(penalizer_coef=0.01)
-        ggf.fit(returning_customers['frequency'], returning_customers['monetary_value'])
-        
-        # Calculate Predicted CLV (Customer Lifetime Value)
-        data['predicted_clv'] = ggf.customer_lifetime_value(
-            bgf, data['frequency'], data['recency'], data['T'], 
-            data['monetary_value'], time=1, discount_rate=0.01 # time=1 means 1 month
-        )
+        ggf = None
+        for p in penalizers_to_try:
+            try:
+                temp_ggf = GammaGammaFitter(penalizer_coef=p)
+                temp_ggf.fit(returning_customers['frequency'], returning_customers['monetary_value'])
+                ggf = temp_ggf
+                break # Success!
+            except Exception:
+                continue
+                
+        if ggf is not None:
+            # Calculate Predicted CLV
+            data['predicted_clv'] = ggf.customer_lifetime_value(
+                bgf, data['frequency'], data['recency'], data['T'], 
+                data['monetary_value'], time=1, discount_rate=0.01 
+            )
+        else:
+            data['predicted_clv'] = 0  # Fallback if Gamma-Gamma completely fails
     else:
         data['predicted_clv'] = 0
 
     return data.sort_values(by='predicted_purchases_30d', ascending=False)
-
 
 def get_aggregate_forecast(df, date_col, amt_col):
     """Predicts total revenue for the next month using Gradient Boosting."""
